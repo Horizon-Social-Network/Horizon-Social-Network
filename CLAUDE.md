@@ -71,13 +71,32 @@ Settled by the spec. Do not reopen these without changing the spec:
   port. They are for Kubernetes and Prometheus, not routed through the ingress, and not in the
   spec.
 
+## Service communication
+
+Decided in `docs/adr/0001-rest-at-the-edge-events-between-services.md`. Read it before
+proposing a protocol change.
+
+- **Clients to services**: REST + JSON through the ingress, as in `hsn-openapi.yml`, with
+  SSE for real time. No gRPC.
+- **post-service to feed-service**: events on Redis Streams, never a direct call.
+  post-service appends `post.created`, `post.deleted` or `post.stats` after its write
+  succeeds. feed-service reads them through a consumer group and acknowledges each event
+  after handling it.
+- **Delivery is at least once.** Every event handler must be idempotent: handling the same
+  event twice leaves the same feed as handling it once.
+- **Synchronous internal calls** use plain HTTP/JSON on endpoints that are not routed through
+  the ingress and not in `hsn-openapi.yml`. Document each one's request and response shape in
+  the owning service's repository.
+- Architecture decisions go in `docs/adr/NNNN-<slug>.md`, one decision per file, numbered in
+  order.
+
 ## Decisions to record
 
 Fill these in as they are made. Until then, ask instead of assuming.
 
 - Web stack, mobile stack, backend stack and package manager
 - Repository name of each service
-- How feed-service builds feeds (fan-out on write or on read) and learns about new posts
+- How feed-service builds feeds (fan-out on write or on read) and gets a user's connections
 - Local stack details and the branch-to-environment mapping
 - The CI gate per service and which check is required on `main`
 
