@@ -121,11 +121,12 @@ One branch per GitHub Projects issue, cut from an up-to-date `main`:
 <author>/<type>/<issue-number>-<short-slug>
 ```
 
-- `<author>` is the author's first and last name, lowercase, joined by hyphens. Use the
-  same one on every branch.
+- `<author>` is the author's first and last name in PascalCase, with no separators
+  (`JaneDoe`). Use the same one on every branch.
 - `<type>` is one of the commit types below.
-- `<short-slug>` is lowercase words joined by hyphens, three to five words.
-- Examples: `jane-doe/feat/42-like-a-post`, `john-smith/fix/57-feed-skips-shared-posts`.
+- `<short-slug>` is lowercase words joined by hyphens, three to five words. Only the author
+  part is PascalCase.
+- Examples: `JaneDoe/feat/42-like-a-post`, `JohnSmith/fix/57-feed-skips-shared-posts`.
 - Only the author pushes to their branch. Delete it after it is merged.
 
 ### Commits
