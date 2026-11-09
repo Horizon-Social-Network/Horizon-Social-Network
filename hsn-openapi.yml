@@ -1,0 +1,1400 @@
+openapi: 3.1.0
+info:
+  title: Horizon Social Network API
+  version: 1.0.0
+  description: |
+    Public API used by the Horizon web and mobile apps.
+
+    All paths are served under the `/api/v1` prefix. Each path prefix is owned by one
+    backend service, so the Istio ingress can route on prefix alone:
+
+    | Prefix                  | Service       | Data store        |
+    |-------------------------|---------------|-------------------|
+    | `/api/v1/auth`          | user-service  | PostgreSQL, Redis |
+    | `/api/v1/users`         | user-service  | PostgreSQL        |
+    | `/api/v1/connections`   | user-service  | PostgreSQL        |
+    | `/api/v1/posts`         | post-service  | MongoDB           |
+    | `/api/v1/feed`          | feed-service  | Redis             |
+
+    **Authentication.** Endpoints require a JWT access token in the
+    `Authorization: Bearer <token>` header unless marked otherwise. Access tokens are
+    short-lived; use `POST /auth/refresh` with the refresh token to get a new pair.
+
+    **Pagination.** List endpoints are cursor-based and return
+    `{ items, meta: { hasNext, nextCursor } }`. When `meta.hasNext` is `true`, pass
+    `meta.nextCursor` as the `cursor` query parameter to get the next page. When
+    `meta.hasNext` is `false`, `meta.nextCursor` is `null`.
+
+    **Errors.** All errors use the RFC 9457 `application/problem+json` format.
+
+    **Health checks.** Each service also exposes `GET /healthz` (liveness),
+    `GET /readyz` (readiness) and `GET /metrics` (Prometheus) on its own port. These are
+    for Kubernetes and Prometheus only, are not routed through the ingress, and are not
+    part of this spec.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local (Docker Compose / k3d)
+  - url: https://horizon.example.com/api/v1
+    description: Production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Auth
+    description: Sign up, sign in, sign out, token refresh (user-service)
+  - name: Users
+    description: Profiles and user search (user-service)
+  - name: Connections
+    description: Connection requests and the user's network (user-service)
+  - name: Posts
+    description: Posts, likes, comments and shares (post-service)
+  - name: Feed
+    description: News feed and real-time updates (feed-service)
+
+paths:
+  # ───────────────────────────── Auth ─────────────────────────────
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Create an account
+      description: |
+        Two ways to call this endpoint:
+
+        - **Self-registration (no token).** Anyone can create an account with
+          `role: user` (the default). The new user is signed in and the response
+          includes tokens (`AuthResponse`).
+        - **Account creation by an authorized user (bearer token).** Required for
+          any `role` other than `user`. The caller's token must carry the
+          `users:assign-role` permission (granted to `admin`). The caller stays
+          signed in as themselves, so the response contains only the created user
+          (`CreatedUserResponse`), without tokens.
+
+        Requesting a privileged role without a token returns `401`; with a token
+        that lacks `users:assign-role` returns `403`. The first admin account is
+        created by a seed script at deployment time, not through this endpoint.
+      security:
+        - {}
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/AuthResponse"
+                  - $ref: "#/components/schemas/CreatedUserResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: A privileged role was requested without a valid access token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: The caller lacks the `users:assign-role` permission needed for the requested role.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: An account with this email already exists.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Sign in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Signed in.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Wrong email or password.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Exchange a refresh token for a new token pair
+      description: |
+        Refresh tokens are single-use (rotated). Reusing an old refresh token
+        revokes the whole session.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: New token pair.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          description: Refresh token is invalid, expired or revoked.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Sign out
+      description: Revokes the given refresh token (ends this session).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "204":
+          description: Signed out.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ───────────────────────────── Users ─────────────────────────────
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: getMe
+      summary: Get the signed-in user's profile
+      responses:
+        "200":
+          description: The signed-in user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Me"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    patch:
+      tags: [Users]
+      operationId: updateMe
+      summary: Update the signed-in user's profile
+      description: |
+        Only fields valid for the user's type are accepted (e.g. `major` for
+        students). The user type itself cannot be changed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProfileRequest"
+      responses:
+        "200":
+          description: Updated profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Me"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /users:
+    get:
+      tags: [Users]
+      operationId: searchUsers
+      summary: Search users by name, major, speciality or department
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 2
+            maxLength: 100
+        - name: type
+          in: query
+          required: false
+          description: Restrict results to one user type.
+          schema:
+            $ref: "#/components/schemas/UserType"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Matching users.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserSummaryPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /users/{userId}:
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Get a user's public profile
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: The user's public profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ─────────────────────────── Connections ───────────────────────────
+  /connections:
+    get:
+      tags: [Connections]
+      operationId: listConnections
+      summary: List the signed-in user's connections
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Connected users, most recent first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserSummaryPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /connections/{userId}:
+    delete:
+      tags: [Connections]
+      operationId: removeConnection
+      summary: Remove a connection
+      parameters:
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "204":
+          description: Connection removed.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /connections/requests:
+    get:
+      tags: [Connections]
+      operationId: listConnectionRequests
+      summary: List pending connection requests
+      parameters:
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [incoming, outgoing]
+            default: incoming
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Pending requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionRequestPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Connections]
+      operationId: sendConnectionRequest
+      summary: Send a connection request
+      description: |
+        If the target user already sent a pending request to the caller, the two
+        users are connected immediately and the response status is `accepted`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetUserId]
+              properties:
+                targetUserId:
+                  $ref: "#/components/schemas/Id"
+      responses:
+        "201":
+          description: Request created (or auto-accepted).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionRequest"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Already connected, or a pending request already exists.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /connections/requests/{requestId}:
+    delete:
+      tags: [Connections]
+      operationId: cancelConnectionRequest
+      summary: Cancel an outgoing request
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "204":
+          description: Request cancelled.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /connections/requests/{requestId}/accept:
+    post:
+      tags: [Connections]
+      operationId: acceptConnectionRequest
+      summary: Accept an incoming request
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: Request accepted; the users are now connected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The request is no longer pending.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /connections/requests/{requestId}/decline:
+    post:
+      tags: [Connections]
+      operationId: declineConnectionRequest
+      summary: Decline an incoming request
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: Request declined.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectionRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The request is no longer pending.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  # ───────────────────────────── Posts ─────────────────────────────
+  /posts:
+    get:
+      tags: [Posts]
+      operationId: listPosts
+      summary: List posts by an author (profile timeline)
+      parameters:
+        - name: authorId
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/Id"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Posts by this author, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PostPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Posts]
+      operationId: createPost
+      summary: Publish a plain-text post
+      description: |
+        The post is delivered to the news feeds of the author's connections and
+        pushed to connected clients through `GET /feed/stream`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePostRequest"
+      responses:
+        "201":
+          description: Post created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Post"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /posts/{postId}:
+    get:
+      tags: [Posts]
+      operationId: getPost
+      summary: Get a post
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      responses:
+        "200":
+          description: The post.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Post"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Posts]
+      operationId: deletePost
+      summary: Delete one of your posts
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      responses:
+        "204":
+          description: Post deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /posts/{postId}/like:
+    put:
+      tags: [Posts]
+      operationId: likePost
+      summary: Like a post
+      description: Idempotent; liking a post twice has no extra effect.
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      responses:
+        "200":
+          description: Current like state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LikeState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Posts]
+      operationId: unlikePost
+      summary: Remove your like
+      description: Idempotent.
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      responses:
+        "200":
+          description: Current like state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LikeState"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /posts/{postId}/comments:
+    get:
+      tags: [Posts]
+      operationId: listComments
+      summary: List comments on a post
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Comments, oldest first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommentPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Posts]
+      operationId: createComment
+      summary: Comment on a post
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCommentRequest"
+      responses:
+        "201":
+          description: Comment created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Comment"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /posts/{postId}/comments/{commentId}:
+    delete:
+      tags: [Posts]
+      operationId: deleteComment
+      summary: Delete a comment
+      description: Allowed for the comment's author and the post's author.
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+        - $ref: "#/components/parameters/CommentId"
+      responses:
+        "204":
+          description: Comment deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /posts/{postId}/shares:
+    post:
+      tags: [Posts]
+      operationId: sharePost
+      summary: Share (repost) a post
+      description: |
+        Creates a new post owned by the caller that embeds the original post, with
+        optional text of its own. Sharing a share embeds the original post, not
+        the intermediate share.
+      parameters:
+        - $ref: "#/components/parameters/PostId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SharePostRequest"
+      responses:
+        "201":
+          description: The new share post.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Post"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ───────────────────────────── Feed ─────────────────────────────
+  /feed:
+    get:
+      tags: [Feed]
+      operationId: getFeed
+      summary: Get the signed-in user's news feed
+      description: Posts from the user's connections and the user's own posts, newest first.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: A page of the feed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PostPage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /feed/stream:
+    get:
+      tags: [Feed]
+      operationId: streamFeed
+      summary: Real-time feed updates (Server-Sent Events)
+      description: |
+        Long-lived `text/event-stream` connection. Each SSE message has an `event`
+        name and a JSON `data` payload described by `FeedEvent`:
+
+        - `post.created`: a connection (or the user) published a post
+        - `post.deleted`: a post in the feed was deleted
+        - `post.stats`: like, comment or share counts changed
+
+        The server sends a comment line (`: ping`) every 25 seconds to keep the
+        connection open through proxies. Clients should reconnect with the
+        `Last-Event-ID` header to resume after a disconnect.
+
+        The browser `EventSource` API cannot send headers, so the web app should
+        use a fetch-based SSE client (e.g. `@microsoft/fetch-event-source`) and the
+        mobile app an SSE library that supports headers (e.g. `react-native-sse`).
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event stream.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/FeedEvent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/Id"
+    PostId:
+      name: postId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/Id"
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/Id"
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/Id"
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from a previous response's `nextCursor`.
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+
+  responses:
+    BadRequest:
+      description: The request is invalid (see `errors` for field-level details).
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthorized:
+      description: Missing, invalid or expired access token.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: The caller is not allowed to perform this action.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: The resource does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    TooManyRequests:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    # ── Common ──
+    Id:
+      type: string
+      description: Opaque identifier (UUID for user-service, ObjectId for post-service).
+      examples: ["6f1c2a9e-4b7d-4f1e-9c3a-2d8e5b7a1f04"]
+
+    Timestamp:
+      type: string
+      format: date-time
+
+    PageMeta:
+      type: object
+      description: Pagination metadata returned by every list endpoint.
+      required: [hasNext, nextCursor]
+      properties:
+        hasNext:
+          type: boolean
+          description: Whether another page exists after this one.
+        nextCursor:
+          type: [string, "null"]
+          description: Cursor for the next page; `null` when `hasNext` is `false`.
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          examples: ["https://horizon.example.com/problems/validation-error"]
+        title:
+          type: string
+          examples: ["Validation failed"]
+        status:
+          type: integer
+          examples: [400]
+        detail:
+          type: string
+        instance:
+          type: string
+        errors:
+          type: array
+          description: Field-level validation errors.
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+                examples: ["content"]
+              message:
+                type: string
+                examples: ["Must be at most 2000 characters"]
+
+    # ── Auth ──
+    RegisterRequest:
+      oneOf:
+        - $ref: "#/components/schemas/RegisterStudentRequest"
+        - $ref: "#/components/schemas/RegisterStaffRequest"
+        - $ref: "#/components/schemas/RegisterTeacherRequest"
+      discriminator:
+        propertyName: type
+        mapping:
+          student: "#/components/schemas/RegisterStudentRequest"
+          staff: "#/components/schemas/RegisterStaffRequest"
+          teacher: "#/components/schemas/RegisterTeacherRequest"
+
+    RegisterBase:
+      type: object
+      required: [email, password, firstName, lastName, type]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        bio:
+          type: string
+          maxLength: 300
+        type:
+          $ref: "#/components/schemas/UserType"
+        role:
+          $ref: "#/components/schemas/Role"
+
+    RegisterStudentRequest:
+      allOf:
+        - $ref: "#/components/schemas/RegisterBase"
+        - $ref: "#/components/schemas/StudentFields"
+
+    RegisterStaffRequest:
+      allOf:
+        - $ref: "#/components/schemas/RegisterBase"
+        - $ref: "#/components/schemas/StaffFields"
+
+    RegisterTeacherRequest:
+      allOf:
+        - $ref: "#/components/schemas/RegisterBase"
+        - $ref: "#/components/schemas/TeacherFields"
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, expiresIn]
+      properties:
+        accessToken:
+          type: string
+          description: JWT, valid for `expiresIn` seconds.
+        refreshToken:
+          type: string
+        expiresIn:
+          type: integer
+          examples: [900]
+
+    AuthResponse:
+      allOf:
+        - $ref: "#/components/schemas/TokenPair"
+        - type: object
+          required: [user]
+          properties:
+            user:
+              $ref: "#/components/schemas/Me"
+
+    CreatedUserResponse:
+      description: Returned when an authorized user creates an account for someone else.
+      type: object
+      required: [user]
+      properties:
+        user:
+          $ref: "#/components/schemas/Me"
+
+    # ── Users ──
+    UserType:
+      type: string
+      description: Profile kind; decides which profile fields apply.
+      enum: [student, staff, teacher]
+
+    Role:
+      type: string
+      description: |
+        Authorization role, independent of the profile type (an admin can be
+        staff or a teacher). Included in the access token's `role` claim.
+
+        - `user`: default; all regular features
+        - `moderator`: can also delete any post or comment
+        - `admin`: everything, plus `users:assign-role`
+      enum: [user, moderator, admin]
+      default: user
+
+    StudentFields:
+      type: object
+      required: [major]
+      properties:
+        type:
+          const: student
+        major:
+          type: string
+          maxLength: 100
+          examples: ["Computer Science"]
+        yearOfStudy:
+          type: integer
+          minimum: 1
+          maximum: 8
+
+    StaffFields:
+      type: object
+      required: [department, position]
+      properties:
+        type:
+          const: staff
+        department:
+          type: string
+          maxLength: 100
+          examples: ["Registrar Office"]
+        position:
+          type: string
+          description: Role in the administration.
+          maxLength: 100
+          examples: ["Admissions Officer"]
+
+    TeacherFields:
+      type: object
+      required: [speciality]
+      properties:
+        type:
+          const: teacher
+        speciality:
+          type: string
+          maxLength: 100
+          examples: ["Distributed Systems"]
+        department:
+          type: string
+          maxLength: 100
+
+    UserBase:
+      type: object
+      required: [id, firstName, lastName, type, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/Id"
+        firstName:
+          type: string
+        lastName:
+          type: string
+        bio:
+          type: [string, "null"]
+        type:
+          $ref: "#/components/schemas/UserType"
+        connectionCount:
+          type: integer
+          minimum: 0
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    Student:
+      allOf:
+        - $ref: "#/components/schemas/UserBase"
+        - $ref: "#/components/schemas/StudentFields"
+
+    Staff:
+      allOf:
+        - $ref: "#/components/schemas/UserBase"
+        - $ref: "#/components/schemas/StaffFields"
+
+    Teacher:
+      allOf:
+        - $ref: "#/components/schemas/UserBase"
+        - $ref: "#/components/schemas/TeacherFields"
+
+    User:
+      oneOf:
+        - $ref: "#/components/schemas/Student"
+        - $ref: "#/components/schemas/Staff"
+        - $ref: "#/components/schemas/Teacher"
+      discriminator:
+        propertyName: type
+        mapping:
+          student: "#/components/schemas/Student"
+          staff: "#/components/schemas/Staff"
+          teacher: "#/components/schemas/Teacher"
+
+    Me:
+      description: The signed-in user, including private fields.
+      allOf:
+        - $ref: "#/components/schemas/User"
+        - type: object
+          required: [email, role]
+          properties:
+            email:
+              type: string
+              format: email
+            role:
+              $ref: "#/components/schemas/Role"
+
+    UserProfile:
+      description: Another user's public profile, as seen by the caller.
+      allOf:
+        - $ref: "#/components/schemas/User"
+        - type: object
+          required: [connectionStatus]
+          properties:
+            connectionStatus:
+              $ref: "#/components/schemas/ConnectionStatus"
+            pendingRequestId:
+              description: Set when `connectionStatus` is a pending state.
+              oneOf:
+                - $ref: "#/components/schemas/Id"
+                - type: "null"
+
+    UpdateProfileRequest:
+      type: object
+      minProperties: 1
+      properties:
+        firstName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        lastName:
+          type: string
+          minLength: 1
+          maxLength: 50
+        bio:
+          type: [string, "null"]
+          maxLength: 300
+        major:
+          type: string
+          maxLength: 100
+        yearOfStudy:
+          type: integer
+          minimum: 1
+          maximum: 8
+        department:
+          type: string
+          maxLength: 100
+        position:
+          type: string
+          maxLength: 100
+        speciality:
+          type: string
+          maxLength: 100
+
+    UserSummary:
+      description: Compact user representation used in lists, posts and comments.
+      type: object
+      required: [id, firstName, lastName, type, headline]
+      properties:
+        id:
+          $ref: "#/components/schemas/Id"
+        firstName:
+          type: string
+        lastName:
+          type: string
+        type:
+          $ref: "#/components/schemas/UserType"
+        headline:
+          type: string
+          description: Display line built from the profile.
+          examples:
+            ["Student · Computer Science", "Teacher · Distributed Systems"]
+        connectionStatus:
+          $ref: "#/components/schemas/ConnectionStatus"
+
+    UserSummaryPage:
+      type: object
+      required: [items, meta]
+      properties:
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/UserSummary"
+
+    # ── Connections ──
+    ConnectionStatus:
+      type: string
+      description: Relationship between the caller and this user.
+      enum: [self, none, connected, pending_outgoing, pending_incoming]
+
+    ConnectionRequest:
+      type: object
+      required: [id, from, to, status, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/Id"
+        from:
+          $ref: "#/components/schemas/UserSummary"
+        to:
+          $ref: "#/components/schemas/UserSummary"
+        status:
+          type: string
+          enum: [pending, accepted, declined]
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+        respondedAt:
+          oneOf:
+            - $ref: "#/components/schemas/Timestamp"
+            - type: "null"
+
+    ConnectionRequestPage:
+      type: object
+      required: [items, meta]
+      properties:
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ConnectionRequest"
+
+    # ── Posts ──
+    PostContent:
+      type: string
+      description: Plain text only; no HTML or Markdown is rendered.
+      minLength: 1
+      maxLength: 2000
+
+    CreatePostRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          $ref: "#/components/schemas/PostContent"
+
+    SharePostRequest:
+      type: object
+      properties:
+        content:
+          description: Optional text added by the person sharing.
+          type: string
+          maxLength: 2000
+
+    PostStats:
+      type: object
+      required: [likeCount, commentCount, shareCount]
+      properties:
+        likeCount:
+          type: integer
+          minimum: 0
+        commentCount:
+          type: integer
+          minimum: 0
+        shareCount:
+          type: integer
+          minimum: 0
+
+    SharedPost:
+      description: The original post embedded in a share. Null if it was deleted.
+      type: object
+      required: [id, author, content, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/Id"
+        author:
+          $ref: "#/components/schemas/UserSummary"
+        content:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    Post:
+      allOf:
+        - type: object
+          required: [id, author, content, likedByMe, createdAt]
+          properties:
+            id:
+              $ref: "#/components/schemas/Id"
+            author:
+              $ref: "#/components/schemas/UserSummary"
+            content:
+              description: Empty string allowed only for shares without added text.
+              type: string
+              maxLength: 2000
+            sharedPost:
+              description: Present only when this post is a share.
+              oneOf:
+                - $ref: "#/components/schemas/SharedPost"
+                - type: "null"
+            likedByMe:
+              type: boolean
+            createdAt:
+              $ref: "#/components/schemas/Timestamp"
+        - $ref: "#/components/schemas/PostStats"
+
+    PostPage:
+      type: object
+      required: [items, meta]
+      properties:
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Post"
+
+    LikeState:
+      type: object
+      required: [postId, likedByMe, likeCount]
+      properties:
+        postId:
+          $ref: "#/components/schemas/Id"
+        likedByMe:
+          type: boolean
+        likeCount:
+          type: integer
+          minimum: 0
+
+    # ── Comments ──
+    CreateCommentRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 1000
+
+    Comment:
+      type: object
+      required: [id, postId, author, content, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/Id"
+        postId:
+          $ref: "#/components/schemas/Id"
+        author:
+          $ref: "#/components/schemas/UserSummary"
+        content:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/Timestamp"
+
+    CommentPage:
+      type: object
+      required: [items, meta]
+      properties:
+        meta:
+          $ref: "#/components/schemas/PageMeta"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Comment"
+
+    # ── Feed events (SSE) ──
+    FeedEvent:
+      oneOf:
+        - $ref: "#/components/schemas/PostCreatedEvent"
+        - $ref: "#/components/schemas/PostDeletedEvent"
+        - $ref: "#/components/schemas/PostStatsEvent"
+      discriminator:
+        propertyName: event
+        mapping:
+          post.created: "#/components/schemas/PostCreatedEvent"
+          post.deleted: "#/components/schemas/PostDeletedEvent"
+          post.stats: "#/components/schemas/PostStatsEvent"
+
+    PostCreatedEvent:
+      type: object
+      required: [event, id, data]
+      properties:
+        event:
+          const: post.created
+        id:
+          type: string
+          description: Event ID, usable as `Last-Event-ID`.
+        data:
+          $ref: "#/components/schemas/Post"
+
+    PostDeletedEvent:
+      type: object
+      required: [event, id, data]
+      properties:
+        event:
+          const: post.deleted
+        id:
+          type: string
+        data:
+          type: object
+          required: [postId]
+          properties:
+            postId:
+              $ref: "#/components/schemas/Id"
+
+    PostStatsEvent:
+      type: object
+      required: [event, id, data]
+      properties:
+        event:
+          const: post.stats
+        id:
+          type: string
+        data:
+          allOf:
+            - type: object
+              required: [postId]
+              properties:
+                postId:
+                  $ref: "#/components/schemas/Id"
+            - $ref: "#/components/schemas/PostStats"
