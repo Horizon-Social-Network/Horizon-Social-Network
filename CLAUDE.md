@@ -100,18 +100,85 @@ Fill these in as they are made. Until then, ask instead of assuming.
 - Local stack details and the branch-to-environment mapping
 - The CI gate per service and which check is required on `main`
 
-## Git and commits
+## Git, branches, commits and pull requests
 
 The professor grades each repository's commit history: authors, frequency, size and content.
+Every rule here exists so that history shows small, well-described work from its real author.
+
+### Who commits
 
 - Never commit unless the user asks for that commit in the current request. Leave changes in
   the working tree for review.
 - Commits are made from the user's own account. No `Co-Authored-By` trailer and no AI
-  attribution of any kind.
-- Small commits of files that belong together, one concern each, with a message that says
-  what changed and why. Never one large commit at the end.
-- Never push to `main`. Work in a branch, open a pull request, and get one review before
-  merging. Link the GitHub Projects issue in the pull request.
+  attribution of any kind. Never commit or push work on behalf of another team member.
+- Never push to `main`, and never force-push a branch someone else is working on.
+
+### Branches
+
+One branch per GitHub Projects issue, cut from an up-to-date `main`:
+
+```
+<author>/<type>/<issue-number>-<short-slug>
+```
+
+- `<author>` is the author's first and last name, lowercase, joined by hyphens. Use the
+  same one on every branch.
+- `<type>` is one of the commit types below.
+- `<short-slug>` is lowercase words joined by hyphens, three to five words.
+- Examples: `jane-doe/feat/42-like-a-post`, `john-smith/fix/57-feed-skips-shared-posts`.
+- Only the author pushes to their branch. Delete it after it is merged.
+
+### Commits
+
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <summary>
+
+<body: what changed and why, wrapped at 72 characters>
+
+Refs #<issue-number>
+```
+
+| Type       | Use for                                            |
+| ---------- | -------------------------------------------------- |
+| `feat`     | a new behaviour a user or client can see           |
+| `fix`      | a bug fix                                          |
+| `refactor` | a code change that changes no behaviour            |
+| `test`     | adding or fixing tests only                        |
+| `docs`     | documentation, ADRs, the API spec                  |
+| `ci`       | GitHub Actions workflows                           |
+| `build`    | Dockerfiles, dependencies, build tooling           |
+| `ops`      | Kubernetes manifests, Istio, Prometheus, Grafana   |
+| `chore`    | anything else that touches no production behaviour |
+
+- `<scope>` is the module or area touched: `auth`, `posts`, `feed`, `connections`, `k8s`.
+  Leave it out when the change has no single area.
+- The summary is imperative, lowercase, no trailing period, at most 72 characters:
+  `feat(posts): add idempotent like endpoint`, not `Added likes.` or `wip`.
+- The body is required whenever the summary alone does not say why.
+- One concern per commit, and every commit leaves the build and tests passing. Split a
+  change that needs "and" in its summary.
+- Breaking API changes add `!` after the type (`feat(posts)!: ...`) and a
+  `BREAKING CHANGE:` footer.
+
+### Pull requests
+
+- The title is a plain, capitalized sentence saying what the pull request does, with no
+  `type(scope):` prefix: `Stream post stats events over SSE`.
+- Keep a pull request small enough to review in one sitting, ideally under 400 changed
+  lines. Split larger work into a sequence of pull requests.
+- The body follows `.github/pull_request_template.md` (What, Why, How to test,
+  `Closes #<issue-number>`). GitHub fills it in when the pull request is opened.
+
+- One approving review from another team member and green CI before merging. The author
+  merges, after addressing every comment.
+- A change to `hsn-openapi.yml` goes in its own pull request before the code that implements
+  it.
+- **Merge with "Create a merge commit"**, never "Squash and merge" or "Rebase and merge".
+  Squashing collapses many small commits into one large one and erases the history the
+  project is graded on. When the branch is behind, merge `main` into it; never rebase a
+  pushed branch.
 
 ## Code style: the contract
 
